@@ -39,17 +39,47 @@ import triton.language as tl
 from typing import Optional
 
 
-@triton.autotune(
-    configs=[
+def get_autotune_configs():
+    """
+    Generate comprehensive autotune configs for different GPU architectures.
+
+    Key considerations:
+    - Larger blocks (128x256, 256x128) work well on high-end GPUs (A100, H100)
+    - Medium blocks (64x128, 128x64) work well on mid-range GPUs (T4, V100)
+    - Smaller blocks (32x64, 64x32) can be better for small matrices
+    - GROUP_SIZE_M controls L2 cache reuse (8 is usually optimal)
+    - num_stages controls software pipelining (more = better latency hiding)
+    - num_warps should match block size (4-8 for large blocks)
+    """
+    configs = [
+        # High-performance configs for large matrices on modern GPUs
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+
+        # Balanced configs for mid-sized matrices
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=8),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
+
+        # Configs for smaller matrices or limited GPU memory
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=4),
         triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
-    ],
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
+
+        # Deeper pipeline configs for high-bandwidth GPUs (A100, H100)
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=8),
+    ]
+    return configs
+
+
+@triton.autotune(
+    configs=get_autotune_configs(),
     key=['M', 'N', 'K'],
 )
 @triton.jit
@@ -131,8 +161,8 @@ def matmul_kernel(
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
 
-    # Convert accumulator to output dtype
-    c = accumulator.to(tl.float16)
+    # Convert accumulator to output dtype (preserves precision of input)
+    c = accumulator.to(c_ptr.dtype.element_ty)
 
     # =========================================================================
     # Store Output Tile
@@ -149,13 +179,14 @@ def matmul_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-def matmul_triton(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+def matmul_triton(a: torch.Tensor, b: torch.Tensor, output_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
     """
     Compute matrix multiplication C = A @ B using Triton.
 
     Args:
         a: Input matrix A of shape (M, K)
         b: Input matrix B of shape (K, N)
+        output_dtype: Optional output dtype (defaults to input dtype)
 
     Returns:
         c: Output matrix C of shape (M, N)
@@ -163,13 +194,22 @@ def matmul_triton(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     # Validate inputs
     assert a.is_cuda and b.is_cuda, "Inputs must be on CUDA"
     assert a.shape[1] == b.shape[0], f"Inner dimensions must match: {a.shape[1]} vs {b.shape[0]}"
-    assert a.is_contiguous() and b.is_contiguous(), "Inputs must be contiguous"
+
+    # Handle non-contiguous inputs
+    if not a.is_contiguous():
+        a = a.contiguous()
+    if not b.is_contiguous():
+        b = b.contiguous()
 
     M, K = a.shape
     K, N = b.shape
 
+    # Output dtype matches input or explicit override
+    if output_dtype is None:
+        output_dtype = a.dtype
+
     # Allocate output
-    c = torch.empty((M, N), device=a.device, dtype=torch.float16)
+    c = torch.empty((M, N), device=a.device, dtype=output_dtype)
 
     # Calculate grid
     # grid = (num_tiles_m * num_tiles_n,)
@@ -235,7 +275,7 @@ def matmul_kernel_simple(
         b_ptrs += BLOCK_K * stride_bk
 
     # Store result
-    c = accumulator.to(tl.float16)
+    c = accumulator.to(c_ptr.dtype.element_ty)
     offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
@@ -254,10 +294,16 @@ def matmul_triton_simple(
     assert a.is_cuda and b.is_cuda
     assert a.shape[1] == b.shape[0]
 
+    # Handle non-contiguous inputs
+    if not a.is_contiguous():
+        a = a.contiguous()
+    if not b.is_contiguous():
+        b = b.contiguous()
+
     M, K = a.shape
     K, N = b.shape
 
-    c = torch.empty((M, N), device=a.device, dtype=torch.float16)
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
 
     grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n))
 
@@ -283,23 +329,26 @@ def benchmark_matmul(
     M: int = 1024,
     N: int = 1024,
     K: int = 1024,
-    warmup: int = 25,
+    warmup: int = 50,
     rep: int = 100,
+    dtype: torch.dtype = torch.float16,
 ) -> dict:
     """
     Benchmark Triton matmul vs PyTorch/cuBLAS.
 
     Returns dict with timing and TFLOPS metrics.
     """
-    # Create inputs in float16 for better performance
-    a = torch.randn((M, K), device='cuda', dtype=torch.float16)
-    b = torch.randn((K, N), device='cuda', dtype=torch.float16)
+    # Create inputs
+    a = torch.randn((M, K), device='cuda', dtype=dtype)
+    b = torch.randn((K, N), device='cuda', dtype=dtype)
 
-    # Warmup
+    # Warmup (important for autotuning to complete)
     for _ in range(warmup):
         _ = matmul_triton(a, b)
-        _ = torch.matmul(a, b)
+    torch.cuda.synchronize()
 
+    for _ in range(warmup):
+        _ = torch.matmul(a, b)
     torch.cuda.synchronize()
 
     # Benchmark Triton
@@ -348,22 +397,28 @@ def benchmark_matmul(
     }
 
 
-def verify_correctness(M: int = 512, N: int = 512, K: int = 512) -> bool:
+def verify_correctness(M: int = 512, N: int = 512, K: int = 512, dtype: torch.dtype = torch.float16) -> bool:
     """Verify Triton matmul produces correct results."""
-    a = torch.randn((M, K), device='cuda', dtype=torch.float16)
-    b = torch.randn((K, N), device='cuda', dtype=torch.float16)
+    a = torch.randn((M, K), device='cuda', dtype=dtype)
+    b = torch.randn((K, N), device='cuda', dtype=dtype)
 
     triton_result = matmul_triton(a, b)
     torch_result = torch.matmul(a, b)
 
-    # Use larger tolerance for fp16
-    is_correct = torch.allclose(triton_result, torch_result, rtol=1e-2, atol=1e-2)
+    # Use appropriate tolerance based on dtype
+    if dtype == torch.float16:
+        rtol, atol = 1e-2, 1e-2
+    else:
+        rtol, atol = 1e-3, 1e-3
+
+    is_correct = torch.allclose(triton_result, torch_result, rtol=rtol, atol=atol)
 
     if is_correct:
-        print(f"[PASS] Correctness verified for M={M}, N={N}, K={K}")
+        print(f"[PASS] Correctness verified for M={M}, N={N}, K={K} (dtype={dtype})")
     else:
         max_diff = (triton_result - torch_result).abs().max().item()
-        print(f"[FAIL] Max difference: {max_diff}")
+        mean_diff = (triton_result - torch_result).abs().mean().item()
+        print(f"[FAIL] Max difference: {max_diff:.6f}, Mean difference: {mean_diff:.6f}")
 
     return is_correct
 

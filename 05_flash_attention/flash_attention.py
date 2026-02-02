@@ -164,40 +164,37 @@ def flash_attention_forward_kernel(
         # -----------------------------------------------------------------
         # Online softmax update
         # -----------------------------------------------------------------
-        # Find max in this block
+        # Find max in this block for numerical stability
         m_ij = tl.max(qk, axis=1)
 
         # New running max
         m_new = tl.maximum(m_i, m_ij)
 
-        # Correction factors
-        alpha = tl.exp(m_i - m_new)  # Correction for old accumulator
-        beta = tl.exp(m_ij - m_new)  # Scale for new block
+        # Correction factor for old accumulator
+        alpha = tl.exp(m_i - m_new)
 
-        # Update running sum
-        # l_new = l_old * alpha + sum(exp(qk - m_new))
+        # Compute softmax numerator with new max
         p = tl.exp(qk - m_new[:, None])
+
+        # Update running sum of exponentials
         l_new = l_i * alpha + tl.sum(p, axis=1)
 
         # -----------------------------------------------------------------
         # Update output accumulator
         # -----------------------------------------------------------------
-        # Correct old accumulator and add new contribution
-        # acc = acc * (l_i * alpha / l_new) + p @ v / l_new
-        #     = (acc * l_i * alpha + p @ v) / l_new
-
-        # Scale old accumulator
-        acc = acc * (l_i[:, None] * alpha[:, None])
+        # Scale old accumulator by alpha (rescale for new max)
+        # Note: acc tracks unnormalized weighted sum, divide by l at end
+        acc = acc * alpha[:, None]
 
         # Load V block
         v = tl.load(v_ptrs + start_n * stride_vn,
                     mask=(start_n + offs_n[:, None]) < N_CTX,
                     other=0.0)
 
-        # Add new contribution: p @ V
+        # Add new contribution: p @ V (p is unnormalized softmax)
         acc += tl.dot(p.to(v.dtype), v)
 
-        # Update state
+        # Update state for next iteration
         l_i = l_new
         m_i = m_new
 
