@@ -54,6 +54,7 @@ def flash_attention_forward_kernel(
     stride_oz, stride_oh, stride_om, stride_ok,
     # Sequence lengths and head dim
     N_CTX,
+    N_HEADS,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
@@ -66,7 +67,7 @@ def flash_attention_forward_kernel(
     FlashAttention forward pass kernel.
 
     Each program computes one tile of the output matrix.
-    Grid: (batch * n_heads, cdiv(N_CTX, BLOCK_M))
+    Grid: (cdiv(N_CTX, BLOCK_M), batch * n_heads)
 
     The key insight is computing softmax in an "online" manner:
     - Process K,V in blocks
@@ -80,15 +81,15 @@ def flash_attention_forward_kernel(
     off_hz = tl.program_id(1)
 
     # Calculate batch and head indices
-    off_z = off_hz // stride_qh  # Not used directly, but for understanding
-    off_h = off_hz % stride_qh   # Not used directly
+    off_z = off_hz // N_HEADS  # batch index
+    off_h = off_hz % N_HEADS   # head index
 
     # Initialize pointers to Q, K, V for this batch/head
     # Q: [batch, heads, seq, head_dim]
-    q_offset = off_hz * stride_qh
-    k_offset = off_hz * stride_kh
-    v_offset = off_hz * stride_vh
-    o_offset = off_hz * stride_oh
+    q_offset = off_z * stride_qz + off_h * stride_qh
+    k_offset = off_z * stride_kz + off_h * stride_kh
+    v_offset = off_z * stride_vz + off_h * stride_vh
+    o_offset = off_z * stride_oz + off_h * stride_oh
 
     # =========================================================================
     # Load Q tile for this program
@@ -272,6 +273,7 @@ def flash_attention_triton(
         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
         o.stride(0), o.stride(1), o.stride(2), o.stride(3),
         seq_len,
+        n_heads,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_DMODEL=BLOCK_DMODEL,

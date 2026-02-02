@@ -19,6 +19,7 @@ import torch
 import torch.nn.functional as F
 import sys
 import time
+import importlib.util
 from typing import Tuple, List
 
 # Check CUDA
@@ -33,8 +34,12 @@ print(f"Device: {torch.cuda.get_device_name()}")
 print(f"CUDA: {torch.version.cuda}")
 print(f"PyTorch: {torch.__version__}")
 
-# Import kernels
-sys.path.insert(0, '.')
+def load_module(name: str, path: str):
+    """Load a Python module from a file path."""
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 results = []
 
@@ -73,7 +78,9 @@ print("1. VECTOR ADDITION KERNEL")
 print("="*70)
 
 try:
-    from vector_add.vector_add import vector_add_triton, vector_add_torch
+    mod = load_module("vector_add", "01_vector_add/vector_add.py")
+    vector_add_triton = mod.vector_add_triton
+    vector_add_torch = mod.vector_add_torch
 
     def test_vector_add_correctness():
         for size in [1024, 10000, 100000, 1000000]:
@@ -135,7 +142,8 @@ print("2. MATRIX MULTIPLICATION KERNEL")
 print("="*70)
 
 try:
-    from matmul.matmul import matmul_triton
+    mod = load_module("matmul", "02_matmul/matmul.py")
+    matmul_triton = mod.matmul_triton
 
     def test_matmul_correctness():
         for M, N, K in [(128, 128, 128), (256, 512, 256), (1024, 1024, 1024)]:
@@ -190,7 +198,8 @@ print("3. SOFTMAX KERNEL")
 print("="*70)
 
 try:
-    from softmax.softmax import softmax_triton
+    mod = load_module("softmax", "03_softmax/softmax.py")
+    softmax_triton = mod.softmax_triton
 
     def test_softmax_correctness():
         for size in [(128, 1024), (256, 2048), (512, 4096)]:
@@ -248,7 +257,8 @@ print("4. LAYER NORMALIZATION KERNEL")
 print("="*70)
 
 try:
-    from layernorm.layernorm import layernorm_triton
+    mod = load_module("layernorm", "04_layernorm/layernorm.py")
+    layernorm_triton = mod.layernorm_triton
 
     def test_layernorm_correctness():
         for size in [(128, 768), (256, 1024), (512, 2048)]:
@@ -305,7 +315,9 @@ print("5. FLASH ATTENTION KERNEL")
 print("="*70)
 
 try:
-    from flash_attention.flash_attention import flash_attention_triton, standard_attention
+    mod = load_module("flash_attention", "05_flash_attention/flash_attention.py")
+    flash_attention_triton = mod.flash_attention_triton
+    standard_attention = mod.standard_attention
 
     def test_flash_attention_correctness():
         for seq_len in [64, 128, 256, 512]:
